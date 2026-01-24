@@ -36,25 +36,48 @@
 //
 // UPSTREAMADDR is the TCP address to which incoming tunnelled streams will be
 // forwarded.
+// Example static records config file (replace example.com with your own FQDN)
+/* /etc/dnstt/static_records.json
+[
+  {
+    "pattern": "example.com",
+    "type": "A",
+    "value": "1.2.3.4"
+  },
+  {
+    "pattern": "*.example.com",
+    "type": "AAAA",
+    "value": "2001:db8::1"
+  },
+  {
+    "pattern": "info.example.com",
+    "type": "TXT",
+    "value": "Hello World"
+  }
+]
+*/
 package main
 
 import (
 	"bytes"
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	pt "gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	pt "gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib"
 
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
@@ -86,6 +109,12 @@ const (
 	upstreamDialTimeout = 30 * time.Second
 )
 
+type ConfigEntry struct {
+	Pattern string `json:"pattern"` // e.g. "abcd.com" or "*.abcd.com"
+	Type    string `json:"type"`    // "A" or "TXT"
+	Value   string `json:"value"`   // "1.2.3.4" or "hello world"
+}
+
 var (
 	// We don't send UDP payloads larger than this, in an attempt to avoid
 	// network-layer fragmentation. 1280 is the minimum IPv6 MTU, 40 bytes
@@ -101,7 +130,164 @@ var (
 	// On 2020-04-19, the Quad9 resolver was seen to have a UDP payload size
 	// of 1232. Cloudflare's was 1452, and Google's was 4096.
 	maxUDPPayload = 1280 - 40 - 8
+	staticRecords []ConfigEntry
 )
+
+func loadConfig(filename string) error {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // It's okay if config doesn't exist
+		}
+		return err
+	}
+	return json.Unmarshal(data, &staticRecords)
+}
+
+// domainToString converts the [][]byte representation of a name to a string.
+func domainToString(name dns.Name) string {
+	var sb strings.Builder
+	for i, label := range name {
+		if i > 0 {
+			sb.WriteByte('.')
+		}
+		sb.Write(label)
+	}
+	return sb.String()
+}
+
+// matchDomain checks if a domain matches a pattern (supports simple *.suffix).
+func matchDomain(pattern, domain string) bool {
+	pattern = strings.ToLower(pattern)
+	domain = strings.ToLower(domain)
+
+	if pattern == domain {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := pattern[1:] // e.g. ".abcd.com"
+		if strings.HasSuffix(domain, suffix) {
+			// Ensure we don't match "fake.abcd.com" against "*.bcd.com" logic blindly,
+			// though standard DNS wildcard logic is complex, this suffices for "*.abcd.com".
+			return true
+		}
+	}
+	return false
+}
+
+/*
+https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.2
+
+RECORD TYPE     value and meaning
+
+A               1 a host address
+NS              2 an authoritative name server
+MD              3 a mail destination (Obsolete - use MX)
+MF              4 a mail forwarder (Obsolete - use MX)
+CNAME           5 the canonical name for an alias
+SOA             6 marks the start of a zone of authority
+MB              7 a mailbox domain name (EXPERIMENTAL)
+MG              8 a mail group member (EXPERIMENTAL)
+MR              9 a mail rename domain name (EXPERIMENTAL)
+NULL            10 a null RR (EXPERIMENTAL)
+WKS             11 a well known service description
+PTR             12 a domain name pointer
+HINFO           13 host information
+MINFO           14 mailbox or mail list information
+MX              15 mail exchange
+TXT             16 text strings
+
+*/
+
+// staticResponseFor checks if the query matches a static config entry.
+func staticResponseFor(query *dns.Message) *dns.Message {
+	const RECTypeA = 1
+	const RECTypeTXT = 16
+	const RECTypeAAAA = 28
+
+	if query.Flags&0x8000 != 0 {
+		return nil // Not a query
+	}
+	if len(query.Question) != 1 {
+		return nil
+	}
+
+	q := query.Question[0]
+	// Convert query name to lowercase string for case-insensitive matching
+	qName := strings.ToLower(domainToString(q.Name))
+
+	var matchedEntry *ConfigEntry
+
+	for i := range staticRecords {
+		rec := &staticRecords[i]
+
+		// Filter by Record Type
+		switch q.Type {
+		case RECTypeA:
+			if rec.Type != "A" {
+				continue
+			}
+		case RECTypeTXT:
+			if rec.Type != "TXT" {
+				continue
+			}
+		case RECTypeAAAA:
+			if rec.Type != "AAAA" {
+				continue
+			}
+		default:
+			continue // Skip unsupported query types
+		}
+
+		if matchDomain(rec.Pattern, qName) {
+			matchedEntry = rec
+			break
+		}
+	}
+
+	if matchedEntry == nil {
+		return nil
+	}
+
+	// Build Response
+	resp := &dns.Message{
+		ID:       query.ID,
+		Flags:    0x8400, // QR=1, AA=1, RCODE=0
+		Question: query.Question,
+	}
+
+	// Create Answer RR
+	rr := dns.RR{
+		Name:  q.Name,
+		Type:  q.Type,
+		Class: q.Class,
+		TTL:   300,
+	}
+
+	switch matchedEntry.Type {
+	case "A":
+		ip := net.ParseIP(matchedEntry.Value)
+		if ip4 := ip.To4(); ip4 != nil {
+			rr.Data = ip4
+		} else {
+			log.Printf("Invalid IPv4 in config for %s: %s", matchedEntry.Pattern, matchedEntry.Value)
+			return nil
+		}
+	case "AAAA":
+		ip := net.ParseIP(matchedEntry.Value)
+		if ip16 := ip.To16(); ip16 != nil {
+			rr.Data = ip16
+		} else {
+			log.Printf("Invalid IPv6 in config for %s: %s", matchedEntry.Pattern, matchedEntry.Value)
+			return nil
+		}
+	case "TXT":
+		rr.Data = dns.EncodeRDataTXT([]byte(matchedEntry.Value))
+	}
+
+	resp.Answer = append(resp.Answer, rr)
+	return resp
+}
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -531,6 +717,17 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
+		// Check for static config response first
+		if staticMsg := staticResponseFor(&query); staticMsg != nil {
+			buf, err := staticMsg.WireFormat()
+			if err == nil {
+				_, _ = dnsConn.WriteTo(buf, addr)
+			} else {
+				log.Printf("static response WireFormat error: %v", err)
+			}
+			continue
+		}
+
 		resp, payload := responseFor(&query, domain)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
@@ -842,17 +1039,13 @@ func main() {
 	var privkeyFilename string
 	var privkeyString string
 	var pubkeyFilename string
+	var configFile string // Added
 
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  TOR_PT_MANAGED_TRANSPORT_VER=1 TOR_PT_SERVER_TRANSPORTS=dnstt TOR_PT_SERVER_BINDADDR=dnstt-ADDR TOR_PT_ORPORT=UPSTREAMADDR %[1]s -privkey-file server.key t.example.com
-
-
-Example:
-  %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
-  TOR_PT_MANAGED_TRANSPORT_VER=1 TOR_PT_SERVER_TRANSPORTS=dnstt TOR_PT_SERVER_BINDADDR=dnstt-192.168.0.20:53 TOR_PT_ORPORT=127.0.0.1:8000 %[1]s -privkey-file server.key t.example.com
-
+  TOR_PT_MANAGED_TRANSPORT_VER=1 TOR_PT_SERVER_TRANSPORTS=dnstt TOR_PT_SERVER_BINDADDR=dnstt-ADDR TOR_PT_ORPORT=UPSTREAMADDR %[1]s [-config config.json] -privkey-file server.key t.example.com
+...
 `, os.Args[0])
 		flag.PrintDefaults()
 	}
@@ -861,9 +1054,13 @@ Example:
 	flag.StringVar(&privkeyString, "privkey", "", fmt.Sprintf("server private key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
+	flag.StringVar(&configFile, "config", "/etc/dnstt/static_records.json", "path to JSON config file for static records") // Added
 	flag.Parse()
-
 	log.SetFlags(log.LstdFlags | log.LUTC)
+
+	if err := loadConfig(configFile); err != nil {
+		log.Printf("warning: could not load static config from %s: %v", configFile, err)
+	}
 
 	if genKey {
 		// -gen-key mode.
