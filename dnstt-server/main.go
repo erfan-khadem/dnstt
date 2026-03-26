@@ -37,6 +37,7 @@
 // UPSTREAMADDR is the TCP address to which incoming tunnelled streams will be
 // forwarded.
 // Example static records config file (replace example.com with your own FQDN)
+// Note the TRAILING DOT for the NS record. It has to have TRAILING DOT.
 /* /etc/dnstt/static_records.json
 [
   {
@@ -50,6 +51,11 @@
     "value": "2001:db8::1"
   },
   {
+    "pattern": "example.com",
+    "type": "NS",
+    "value": "n.example.com."
+  },
+  {
     "pattern": "info.example.com",
     "type": "TXT",
     "value": "Hello World"
@@ -60,6 +66,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base32"
 	"encoding/binary"
 	"encoding/json"
@@ -70,6 +77,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -129,8 +137,9 @@ var (
 	//
 	// On 2020-04-19, the Quad9 resolver was seen to have a UDP payload size
 	// of 1232. Cloudflare's was 1452, and Google's was 4096.
-	maxUDPPayload = 1280 - 40 - 8
-	staticRecords []ConfigEntry
+	maxUDPPayload   = 1280 - 40 - 8
+	staticRecords   []ConfigEntry
+	staticRecordsMu sync.RWMutex
 )
 
 func loadConfig(filename string) error {
@@ -141,7 +150,57 @@ func loadConfig(filename string) error {
 		}
 		return err
 	}
-	return json.Unmarshal(data, &staticRecords)
+	var newRecords []ConfigEntry
+	if err := json.Unmarshal(data, &newRecords); err != nil {
+		return err
+	}
+	staticRecordsMu.Lock()
+	staticRecords = newRecords
+	staticRecordsMu.Unlock()
+
+	return nil
+}
+func generateRandomIPInSubnet(cidrStr string) net.IP {
+	ip, ipnet, err := net.ParseCIDR(cidrStr)
+	if err != nil {
+		return net.ParseIP(cidrStr) // Fallback to single IP if not a CIDR string
+	}
+
+	isIPv4 := ip.To4() != nil
+
+	if isIPv4 {
+		ip4 := ip.To4()
+		mask := ipnet.Mask
+		if len(mask) == 16 { // Ensure 4-byte mask
+			mask = mask[12:]
+		}
+		randomIP := make(net.IP, 4)
+		attempts := 0
+		for attempts < 10 { // Max attempts to prevent infinite loops on tiny subnets (/31, /32)
+			attempts++
+			_, _ = rand.Read(randomIP)
+			for i := 0; i < 4; i++ {
+				// Combine network bits with randomized host bits
+				randomIP[i] = (ip4[i] & mask[i]) | (randomIP[i] & ^mask[i])
+			}
+			lastOctet := randomIP[3]
+			// Constraint: Avoid last octet 0, 1, and 255
+			if lastOctet != 0 && lastOctet != 1 && lastOctet != 255 {
+				return randomIP
+			}
+		}
+		return ip4 // Fallback if it couldn't find a valid IP in 10 tries
+	} else {
+		// IPv6 logic
+		ip16 := ip.To16()
+		mask := ipnet.Mask
+		randomIP := make(net.IP, 16)
+		_, _ = rand.Read(randomIP)
+		for i := 0; i < 16; i++ {
+			randomIP[i] = (ip16[i] & mask[i]) | (randomIP[i] & ^mask[i])
+		}
+		return randomIP
+	}
 }
 
 // domainToString converts the [][]byte representation of a name to a string.
@@ -202,6 +261,7 @@ TXT             16 text strings
 // staticResponseFor checks if the query matches a static config entry.
 func staticResponseFor(query *dns.Message) *dns.Message {
 	const RECTypeA = 1
+	const RECTypeNS = 2
 	const RECTypeTXT = 16
 	const RECTypeAAAA = 28
 
@@ -216,8 +276,10 @@ func staticResponseFor(query *dns.Message) *dns.Message {
 	// Convert query name to lowercase string for case-insensitive matching
 	qName := strings.ToLower(domainToString(q.Name))
 
-	var matchedEntry *ConfigEntry
+	var matchedEntry ConfigEntry
+	var found bool
 
+	staticRecordsMu.RLock()
 	for i := range staticRecords {
 		rec := &staticRecords[i]
 
@@ -225,6 +287,10 @@ func staticResponseFor(query *dns.Message) *dns.Message {
 		switch q.Type {
 		case RECTypeA:
 			if rec.Type != "A" {
+				continue
+			}
+		case RECTypeNS:
+			if rec.Type != "NS" {
 				continue
 			}
 		case RECTypeTXT:
@@ -240,12 +306,14 @@ func staticResponseFor(query *dns.Message) *dns.Message {
 		}
 
 		if matchDomain(rec.Pattern, qName) {
-			matchedEntry = rec
+			matchedEntry = *rec
+			found = true
 			break
 		}
 	}
+	staticRecordsMu.RUnlock()
 
-	if matchedEntry == nil {
+	if !found {
 		return nil
 	}
 
@@ -266,15 +334,24 @@ func staticResponseFor(query *dns.Message) *dns.Message {
 
 	switch matchedEntry.Type {
 	case "A":
-		ip := net.ParseIP(matchedEntry.Value)
+		//ip := net.ParseIP(matchedEntry.Value)
+		ip := generateRandomIPInSubnet(matchedEntry.Value)
 		if ip4 := ip.To4(); ip4 != nil {
 			rr.Data = ip4
 		} else {
 			log.Printf("Invalid IPv4 in config for %s: %s", matchedEntry.Pattern, matchedEntry.Value)
 			return nil
 		}
+	case "NS":
+		encoded, err := dns.EncodeDomainName(matchedEntry.Value)
+		if err != nil {
+			log.Printf("Invalid NS domain for %s: %s", matchedEntry.Pattern, matchedEntry.Value)
+			return nil
+		}
+		rr.Data = encoded
 	case "AAAA":
-		ip := net.ParseIP(matchedEntry.Value)
+		//ip := net.ParseIP(matchedEntry.Value)
+		ip := generateRandomIPInSubnet(matchedEntry.Value)
 		if ip16 := ip.To16(); ip16 != nil {
 			rr.Data = ip16
 		} else {
@@ -287,6 +364,55 @@ func staticResponseFor(query *dns.Message) *dns.Message {
 
 	resp.Answer = append(resp.Answer, rr)
 	return resp
+}
+
+func startAPI(addr string, configPath string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/records", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			staticRecordsMu.RLock()
+			data, err := json.Marshal(staticRecords)
+			staticRecordsMu.RUnlock()
+
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(data)
+
+		} else if r.Method == http.MethodPost {
+			var newRecords []ConfigEntry
+			if err := json.NewDecoder(r.Body).Decode(&newRecords); err != nil {
+				http.Error(w, "Invalid JSON body: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			// Replace the records
+			staticRecordsMu.Lock()
+			staticRecords = newRecords
+			staticRecordsMu.Unlock()
+
+			if configPath != "" {
+				if len(newRecords) > 0 && newRecords[0].Type == "SAVE_TO_FS" {
+					data, _ := json.MarshalIndent(newRecords, "", "  ")
+					_ = ioutil.WriteFile(configPath, data, 0644)
+				}
+			}
+
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status": "success"}`))
+		} else {
+			http.Error(w, "Method not allowed. Use GET or POST", http.StatusMethodNotAllowed)
+		}
+	})
+
+	log.Printf("Starting API server on %s", addr)
+	go func() {
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("API server error: %v", err)
+		}
+	}()
 }
 
 // base32Encoding is a base32 encoding without padding.
@@ -709,6 +835,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			}
 			return err
 		}
+		//log.Printf("Received Query from %v", addr.String())
 
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
@@ -1040,6 +1167,7 @@ func main() {
 	var privkeyString string
 	var pubkeyFilename string
 	var configFile string // Added
+	var apiAddr string
 
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -1055,11 +1183,16 @@ func main() {
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&configFile, "config", "/etc/dnstt/static_records.json", "path to JSON config file for static records") // Added
+	flag.StringVar(&apiAddr, "api", "", "HTTP API listen address (e.g., 127.0.0.1:8080). Leave empty to disable")
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
 	if err := loadConfig(configFile); err != nil {
 		log.Printf("warning: could not load static config from %s: %v", configFile, err)
+	}
+
+	if apiAddr != "" {
+		startAPI(apiAddr, configFile)
 	}
 
 	if genKey {

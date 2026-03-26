@@ -573,3 +573,19 @@ func EncodeRDataTXT(p []byte) []byte {
 	buf.Write(p)
 	return buf.Bytes()
 }
+
+func EncodeDomainName(name string) ([]byte, error) {
+	var result []byte
+	labels := strings.Split(name, ".")
+
+	for _, label := range labels {
+		if len(label) > 63 {
+			return nil, fmt.Errorf("label too long")
+		}
+		result = append(result, byte(len(label)))
+		result = append(result, []byte(label)...)
+	}
+
+	result = append(result, 0x00) // end of name
+	return result, nil
+}
